@@ -32,7 +32,9 @@ def _aligned_history(prices: pd.DataFrame, as_of: Optional[pd.Timestamp]) -> pd.
 	px = prices.sort_index().copy()
 	if as_of is not None:
 		as_of = pd.Timestamp(as_of)
-		px = px.loc[px.index < as_of]
+		# include the as-of session itself; caller is responsible for picking
+		# an as-of date that avoids look-ahead.
+		px = px.loc[px.index <= as_of]
 	# forward-fill after alignment
 	px = px.ffill()
 	return px
@@ -47,11 +49,12 @@ def compute_eligibility_and_momentum(prices: pd.DataFrame, as_of: Optional[pd.Ti
 	if hist.empty:
 		return pd.DataFrame(columns=["eligible", "momentum"])
 
-	last_price = hist.iloc[-1]
-	ma = hist.rolling(ma_window, min_periods=ma_window).mean().iloc[-1]
-	mom = hist.div(hist.shift(momentum_window)).iloc[-1] - 1.0
+	elig_table = trend_filter(hist, window=ma_window)
+	mom_table = momentum_12m(hist, lookback=momentum_window)
 
-	out = pd.DataFrame({"eligible": (last_price > ma).fillna(False), "momentum": mom})
+	last_eligibility = elig_table.iloc[-1].fillna(False)
+	last_momentum = mom_table.iloc[-1]
+
+	out = pd.DataFrame({"eligible": last_eligibility, "momentum": last_momentum})
 	return out
-
 
