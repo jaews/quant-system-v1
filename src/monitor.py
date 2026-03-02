@@ -7,7 +7,7 @@ import pandas as pd
 
 from signals import compute_eligibility_and_momentum
 from portfolio import build_target_weights
-from risk import apply_risk_controls, realized_vol, current_drawdown
+from risk import apply_risk_controls, current_drawdown
 from backtest import get_rebalance_schedule
 
 
@@ -21,11 +21,67 @@ def get_last_monday(prices_index: pd.DatetimeIndex) -> pd.Timestamp:
     return mondays[-1]
 
 
-def _dd_bucket_from_diag(diag: Dict) -> str:
-    rule = diag.get("dd_rule") if isinstance(diag, dict) else None
-    if rule is None:
-        return "normal"
-    return rule
+def _aligned_equity_curve(prices_index: pd.DatetimeIndex, equity_curve: pd.Series, asof: pd.Timestamp) -> pd.Series:
+    if equity_curve is None or equity_curve.empty:
+        return pd.Series(dtype=float)
+    idx = pd.DatetimeIndex(sorted(set(prices_index)))
+    eq = equity_curve.sort_index()
+    eq = eq[~eq.index.duplicated(keep="last")]
+    aligned_idx = idx[idx <= asof].intersection(eq.index)
+    if aligned_idx.empty:
+        return pd.Series(dtype=float)
+    return eq.reindex(aligned_idx).dropna().astype(float)
+
+
+def _drawdown_state(equity_curve: pd.Series, asof: pd.Timestamp, recovery_lookback: int) -> tuple[float, float]:
+    if equity_curve is None or equity_curve.empty:
+        return 0.0, 0.0
+    dd_series = equity_curve / equity_curve.cummax() - 1.0
+    if dd_series.empty:
+        return 0.0, 0.0
+    current_dd = float(current_drawdown(equity_curve, asof))
+    lookback = max(int(recovery_lookback), 1)
+    trailing_min_dd = float(dd_series.iloc[-lookback:].min())
+    return current_dd, trailing_min_dd
+
+
+def _dd_bucket_from_drawdown(drawdown: float, trailing_min_dd: float) -> str:
+    if trailing_min_dd <= -0.10 and drawdown > -0.10:
+        return "recovery"
+    if drawdown <= -0.30:
+        return "dd30"
+    if drawdown <= -0.22:
+        return "dd22"
+    if drawdown <= -0.15:
+        return "dd15"
+    return "normal"
+
+
+def next_rebalance_date(prices_index: pd.DatetimeIndex, asof: pd.Timestamp) -> pd.Timestamp | None:
+    """Return the next monthly decision date using an inclusive `>= asof` rule."""
+    if prices_index is None or len(prices_index) == 0:
+        return None
+    idx = pd.DatetimeIndex(sorted(set(prices_index)))
+    asof = pd.Timestamp(asof)
+    if asof > idx[-1]:
+        return None
+
+    # Reuse the executable schedule first, then fall back to the inclusive
+    # month-level decision date when the current month has no later exec day.
+    for d in get_rebalance_schedule(idx):
+        if d >= asof:
+            return d
+
+    future_months = idx[idx >= asof].to_period("M").unique()
+    for m in future_months:
+        month_idx = idx[idx.to_period("M") == m]
+        if month_idx.empty:
+            continue
+        fridays = month_idx[month_idx.weekday == 4]
+        candidate = fridays[-1] if not fridays.empty else month_idx[-1]
+        if candidate >= asof:
+            return candidate
+    return None
 
 
 def compute_current_state(prices: pd.DataFrame, equity_curve: pd.Series, config: Optional[Dict] = None) -> Dict:
@@ -46,37 +102,36 @@ def compute_current_state(prices: pd.DataFrame, equity_curve: pd.Series, config:
         "target_vol": 0.12,
         "crypto_cap": 0.25,
         "bil_ticker": "BIL",
+        "recovery_lookback": 252,
     }
     if config:
         cfg.update(config)
 
     idx = prices.index.sort_values()
     asof = idx[-1]
+    prices_asof = prices.loc[idx[idx <= asof]]
+    equity_asof = _aligned_equity_curve(idx, equity_curve, asof)
 
     # compute signals as-of asof
-    elig = compute_eligibility_and_momentum(prices, as_of=asof, ma_window=cfg["ma_window"], momentum_window=cfg["mom_lookback"])
+    elig = compute_eligibility_and_momentum(prices_asof, as_of=asof, ma_window=cfg["ma_window"], momentum_window=cfg["mom_lookback"])
 
     base_w = build_target_weights(elig, top_n=cfg["top_n"], cash_ticker=cfg["bil_ticker"]) if not elig.empty else pd.Series({cfg["bil_ticker"]: 1.0})
 
-    # determine next rebalance: first scheduled > asof
-    sched = get_rebalance_schedule(idx)
-    next_reb = None
-    for d in sched:
-        if d > asof:
-            next_reb = d
-            break
+    next_reb = next_rebalance_date(idx, asof)
 
-    # For risk controls we need a rebalance_date; if next_reb exists use it, else use asof + 1 day
-    rebalance_date = next_reb if next_reb is not None else (asof + pd.Timedelta(days=1))
+    # Risk controls need a date strictly after the monitoring as-of so they evaluate
+    # using data up to `asof`.
+    rebalance_date = next_reb if next_reb is not None and next_reb > asof else (asof + pd.Timedelta(days=1))
 
     # apply risk controls (will validate inside)
-    target_w, diag = apply_risk_controls(base_w, prices, equity_curve, rebalance_date, config={"target_vol": cfg["target_vol"], "lookback": cfg["vol_lookback"]})
+    risk_equity = equity_asof if not equity_asof.empty else pd.Series([1.0], index=pd.DatetimeIndex([asof]))
+    target_w, diag = apply_risk_controls(base_w, prices_asof, risk_equity, rebalance_date, config={"target_vol": cfg["target_vol"], "lookback": cfg["vol_lookback"]})
 
     # compute realized vol and drawdown explicitly
     rv = diag.get("realized_vol")
     vol_scale = diag.get("vol_scale")
-    dd = diag.get("drawdown") if "drawdown" in diag else float(current_drawdown(equity_curve, asof))
-    dd_bucket = _dd_bucket_from_diag(diag)
+    dd, trailing_min_dd = _drawdown_state(equity_asof, asof, cfg["recovery_lookback"])
+    dd_bucket = _dd_bucket_from_drawdown(dd, trailing_min_dd)
 
     # alerts
     alerts: List[str] = []
@@ -87,6 +142,11 @@ def compute_current_state(prices: pd.DataFrame, equity_curve: pd.Series, config:
 
     if vol_scale is not None and vol_scale < 1.0:
         alerts.append("vol_scale_below_1")
+
+    if dd_bucket in {"dd15", "dd22", "dd30"}:
+        alerts.append(f"drawdown_regime:{dd_bucket}")
+    elif dd_bucket == "recovery":
+        alerts.append("drawdown_recovery")
 
     # asset dropped from eligibility
     prev_elig = last_state.get("eligible") if last_state else None

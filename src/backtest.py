@@ -11,13 +11,16 @@ from risk import apply_risk_controls
 
 
 def get_rebalance_schedule(prices_index: pd.DatetimeIndex) -> List[pd.Timestamp]:
-    """Last trading Friday of each month present in `prices_index`.
+    """Last trading Friday of each executable month in `prices_index`.
 
     Fallback: if no Friday in that month's trading days, use last trading day of month.
+    Terminal month-end dates are excluded when there is no later trading day available
+    to execute the rebalance.
     """
     if prices_index is None or len(prices_index) == 0:
         return []
     idx = pd.DatetimeIndex(sorted(set(prices_index)))
+    last_idx = idx[-1]
     months = idx.to_period("M").unique()
     rebalance_dates: List[pd.Timestamp] = []
     for m in months:
@@ -25,10 +28,12 @@ def get_rebalance_schedule(prices_index: pd.DatetimeIndex) -> List[pd.Timestamp]
         # Fridays weekday == 4
         fridays = month_idx[month_idx.weekday == 4]
         if not fridays.empty:
-            rebalance_dates.append(fridays[-1])
+            candidate = fridays[-1]
         else:
             # fallback to last trading day of month
-            rebalance_dates.append(month_idx[-1])
+            candidate = month_idx[-1]
+        if candidate < last_idx:
+            rebalance_dates.append(candidate)
     return rebalance_dates
 
 

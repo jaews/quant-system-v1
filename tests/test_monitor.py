@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from monitor import get_last_monday, compute_current_state
+from monitor import get_last_monday, compute_current_state, next_rebalance_date
 
 
 def make_prices(index: pd.DatetimeIndex, tickers, daily_returns_by_ticker) -> pd.DataFrame:
@@ -116,24 +116,50 @@ def test_compute_current_state_no_lookahead_future_shock_does_not_change_prior_a
     assert state1['alerts'] == state2['alerts']
 
 
-def test_dd_bucket_transitions_and_alerts():
+def test_dd_bucket_normal_when_drawdown_near_zero_without_prior_deep_drawdown():
     idx = pd.bdate_range('2025-01-01', periods=4)
-    tickers = ['SPY', 'TLT', 'BIL']
-    # prices constant (not relevant for dd tests)
-    prices = make_prices(idx, tickers, {'SPY': 0.0, 'TLT': 0.0, 'BIL': 0.0})
+    prices = make_prices(idx, ['SPY', 'TLT', 'BIL'], {'SPY': 0.0, 'TLT': 0.0, 'BIL': 0.0})
+    eq = pd.Series([1.0, 1.02, 1.01, 1.02], index=idx)
 
-    cases = [(-0.16, 'dd15'), (-0.23, 'dd22'), (-0.31, 'dd30'), (-0.09, 'recovery')]
+    state = compute_current_state(prices, eq)
+    assert pytest.approx(state['drawdown'], rel=1e-12, abs=1e-12) == 0.0
+    assert state['dd_bucket'] == 'normal'
+    assert 'drawdown_recovery' not in state['alerts']
+
+
+def test_dd_bucket_recovery_when_recent_deep_drawdown_has_partially_recovered():
+    idx = pd.bdate_range('2025-01-01', periods=4)
+    prices = make_prices(idx, ['SPY', 'TLT', 'BIL'], {'SPY': 0.0, 'TLT': 0.0, 'BIL': 0.0})
+    eq = pd.Series([1.0, 1.2, 1.05, 1.12], index=idx)
+
+    state = compute_current_state(prices, eq)
+    assert state['dd_bucket'] == 'recovery'
+    assert state['drawdown'] > -0.10
+    assert 'drawdown_recovery' in state['alerts']
+
+
+def test_drawdown_negative_when_below_prior_peak():
+    idx = pd.bdate_range('2025-01-01', periods=4)
+    prices = make_prices(idx, ['SPY', 'TLT', 'BIL'], {'SPY': 0.0, 'TLT': 0.0, 'BIL': 0.0})
+    eq = pd.Series([1.0, 1.2, 1.1, 1.08], index=idx)
+
+    state = compute_current_state(prices, eq)
+    expected_dd = 1.08 / 1.2 - 1.0
+    assert pytest.approx(state['drawdown'], rel=1e-12) == expected_dd
+    assert state['drawdown'] < 0.0
+
+
+def test_drawdown_regime_alerts_follow_bucket_thresholds():
+    idx = pd.bdate_range('2025-01-01', periods=4)
+    prices = make_prices(idx, ['SPY', 'TLT', 'BIL'], {'SPY': 0.0, 'TLT': 0.0, 'BIL': 0.0})
+    cases = [(-0.16, 'dd15'), (-0.23, 'dd22'), (-0.31, 'dd30')]
+
     for dd_val, expected_bucket in cases:
-        # build equity with a prior peak then drop to desired drawdown
         peak = 1.2
-        last = peak * (1.0 + dd_val)
-        eq = pd.Series([1.0, peak, peak, last], index=idx)
+        eq = pd.Series([1.0, peak, peak, peak * (1.0 + dd_val)], index=idx)
         state = compute_current_state(prices, eq)
         assert state['dd_bucket'] == expected_bucket
-        if expected_bucket == 'dd22':
-            assert state['target_weights'].get('BIL', 0.0) >= 0.5
-        if expected_bucket == 'dd30':
-            assert pytest.approx(float(state['target_weights'].get('BIL', 0.0)), rel=1e-9) == 1.0
+        assert f'drawdown_regime:{expected_bucket}' in state['alerts']
 
 
 def test_vol_scale_alert_when_below_one():
@@ -148,7 +174,7 @@ def test_vol_scale_alert_when_below_one():
         if i < 200:
             spy_rets.append(0.0)
         else:
-            spy_rets.append(0.001 + (0.05 if i % 2 == 0 else -0.05))
+            spy_rets.append(0.01 + (0.03 if i % 2 == 0 else -0.01))
     returns = {
         'SPY': np.array(spy_rets),
         'TLT': 0.0002,
@@ -158,9 +184,46 @@ def test_vol_scale_alert_when_below_one():
     weights = pd.Series({'SPY': 0.7, 'TLT': 0.2, 'BIL': 0.1})
     equity = make_equity_curve_from_prices(prices, weights)
 
-    state = compute_current_state(prices, equity)
+    state = compute_current_state(prices, equity, config={'ma_window': 20, 'mom_lookback': 20, 'top_n': 1})
     assert state['vol_scale'] < 1.0
     assert 'vol_scale_below_1' in state['alerts']
+
+
+def test_next_rebalance_date_uses_inclusive_last_trading_friday():
+    idx = pd.bdate_range('2020-05-01', '2020-06-30')
+    assert next_rebalance_date(idx, pd.Timestamp('2020-05-20')) == pd.Timestamp('2020-05-29')
+    assert next_rebalance_date(idx, pd.Timestamp('2020-05-29')) == pd.Timestamp('2020-05-29')
+    assert next_rebalance_date(idx, pd.Timestamp('2020-06-30')) is None
+
+
+def test_compute_current_state_sets_next_rebalance_for_terminal_month():
+    idx = pd.bdate_range('2020-05-01', '2020-05-29')
+    prices = make_prices(idx, ['SPY', 'TLT', 'BIL'], {'SPY': 0.0, 'TLT': 0.0, 'BIL': 0.0})
+    eq = pd.Series(np.linspace(1.0, 1.1, len(idx)), index=idx)
+
+    state = compute_current_state(prices, eq)
+    assert state['asof'] == pd.Timestamp('2020-05-29')
+    assert state['next_rebalance'] == pd.Timestamp('2020-05-29')
+
+
+def test_compute_current_state_ignores_future_equity_after_asof():
+    prices = _base_universe(days=120)
+    weights = pd.Series({'SPY': 0.6, 'TLT': 0.3, 'BIL': 0.1, 'BTC-USD': 0.0})
+    equity = make_equity_curve_from_prices(prices, weights)
+    state1 = compute_current_state(prices, equity)
+
+    future_idx = pd.bdate_range(prices.index[-1] + pd.Timedelta(days=1), periods=3)
+    future_equity = pd.Series([equity.iloc[-1] * 0.4, equity.iloc[-1] * 0.35, equity.iloc[-1] * 0.3], index=future_idx)
+    equity_with_future = pd.concat([equity, future_equity])
+    state2 = compute_current_state(prices, equity_with_future)
+
+    w1 = state1['target_weights'].reindex(sorted(state1['target_weights'].index)).fillna(0.0)
+    w2 = state2['target_weights'].reindex(sorted(state1['target_weights'].index)).fillna(0.0)
+    assert np.allclose(w1.values, w2.values, atol=1e-12)
+    assert pytest.approx(state1['drawdown'], rel=1e-12, abs=1e-12) == state2['drawdown']
+    assert state1['dd_bucket'] == state2['dd_bucket']
+    assert state1['next_rebalance'] == state2['next_rebalance']
+    assert state1['alerts'] == state2['alerts']
 
 
 def test_determinism_same_inputs_same_outputs():

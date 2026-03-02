@@ -125,11 +125,71 @@ def main() -> None:
     st.write(f"Rows: {v.get('n_rows')}, Columns: {v.get('n_columns')}")
 
     if inputs['run']:
+        # prepare config tuple for core backtest (exclude UI-only pad keys)
         config_tuple = ui_io.config_to_tuple({k: v for k, v in cfg.items() if not k.startswith('pad_') and k != 'persist_padded'})
+
+        # Optionally auto-pad the prices in-memory if rebalance execution dates
+        # would fall beyond the last available trading date (prevents ValueError).
+        file_bytes_to_use = file_bytes
+        pad_mode = cfg.get('pad_mode', 'business')
+        pad_max = int(cfg.get('pad_max_days', 0))
+        persist_padded = bool(cfg.get('persist_padded', False))
+
+        if pad_mode != 'none' and pad_max > 0:
+            try:
+                backtest = _import_core_module('backtest')
+                df_pad = prices.copy()
+                pads = 0
+                offset_cls = pd.tseries.offsets.BDay if pad_mode == 'business' else pd.tseries.offsets.Day
+                while pads < pad_max:
+                    try:
+                        rebals = backtest.get_rebalance_schedule(df_pad.index)
+                    except Exception:
+                        break
+                    missing = False
+                    for R in rebals:
+                        try:
+                            backtest.next_trading_day(df_pad.index, R)
+                        except ValueError:
+                            missing = True
+                            break
+                    if not missing:
+                        break
+                    last = df_pad.iloc[-1:].copy()
+                    nextd = df_pad.index[-1] + offset_cls(1)
+                    last.index = [nextd]
+                    df_pad = pd.concat([df_pad, last])
+                    pads += 1
+                if pads:
+                    st.info(f"Auto-padded prices in-memory with {pads} extra {pad_mode} day(s) to allow post-rebalance execution.")
+                    # optionally persist padded file next to input
+                    if persist_padded:
+                        try:
+                            in_path = Path(upload.name)
+                            out_name = in_path.stem + '_padded' + in_path.suffix
+                            out_path = Path('') / out_name
+                            if upload.name.lower().endswith(('.parquet', '.pq')):
+                                df_pad.to_parquet(out_path)
+                            else:
+                                df_pad.to_csv(out_path)
+                            st.success(f"Persisted padded prices to: {out_path}")
+                        except Exception as _err:
+                            st.warning(f"Failed to persist padded file: {_err}")
+                    # convert to bytes for cached backtest
+                    bio = io.BytesIO()
+                    if upload.name.lower().endswith(('.parquet', '.pq')):
+                        df_pad.to_parquet(bio)
+                        file_bytes_to_use = bio.getvalue()
+                    else:
+                        s = df_pad.to_csv()
+                        file_bytes_to_use = s.encode()
+            except Exception:
+                # if padding fails, fall back to original bytes and let backtest raise
+                file_bytes_to_use = file_bytes
 
         try:
             with st.spinner('Running backtest...'):
-                res = run_backtest_cached(file_bytes, upload.name, config_tuple)
+                res = run_backtest_cached(file_bytes_to_use, upload.name, config_tuple)
         except Exception as e:
             st.error("Backtest failed — see details")
             st.exception(e)

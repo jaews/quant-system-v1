@@ -51,6 +51,13 @@ def test_execution_is_next_trading_day():
         next_trading_day(idx, last)
 
 
+def test_rebalance_schedule_excludes_terminal_decision_without_execution_day():
+    idx = pd.bdate_range('2020-04-01', '2020-05-01')
+    sched = get_rebalance_schedule(idx)
+    assert pd.Timestamp('2020-05-01') not in sched
+    assert pd.Timestamp('2020-04-24') in sched
+
+
 def test_transaction_costs_applied_results_differ():
     idx = pd.bdate_range('2025-01-01', periods=80)
     tickers = ['A', 'B']
