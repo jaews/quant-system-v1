@@ -58,29 +58,15 @@ def _dd_bucket_from_drawdown(drawdown: float, trailing_min_dd: float) -> str:
 
 
 def next_rebalance_date(prices_index: pd.DatetimeIndex, asof: pd.Timestamp) -> pd.Timestamp | None:
-    """Return the next monthly decision date using an inclusive `>= asof` rule."""
+    """Return the first valid decision date in the schedule strictly after `asof`."""
     if prices_index is None or len(prices_index) == 0:
         return None
     idx = pd.DatetimeIndex(sorted(set(prices_index)))
     asof = pd.Timestamp(asof)
-    if asof > idx[-1]:
-        return None
 
-    # Reuse the executable schedule first, then fall back to the inclusive
-    # month-level decision date when the current month has no later exec day.
     for d in get_rebalance_schedule(idx):
-        if d >= asof:
+        if d > asof:
             return d
-
-    future_months = idx[idx >= asof].to_period("M").unique()
-    for m in future_months:
-        month_idx = idx[idx.to_period("M") == m]
-        if month_idx.empty:
-            continue
-        fridays = month_idx[month_idx.weekday == 4]
-        candidate = fridays[-1] if not fridays.empty else month_idx[-1]
-        if candidate >= asof:
-            return candidate
     return None
 
 
@@ -139,6 +125,9 @@ def compute_current_state(prices: pd.DataFrame, equity_curve: pd.Series, config:
     last_dd_bucket = last_state.get("dd_bucket")
     if last_dd_bucket is not None and last_dd_bucket != dd_bucket:
         alerts.append(f"drawdown_bucket_changed:{last_dd_bucket}->{dd_bucket}")
+
+    if next_reb is None:
+        alerts.append("next_rebalance_unavailable")
 
     if vol_scale is not None and vol_scale < 1.0:
         alerts.append("vol_scale_below_1")

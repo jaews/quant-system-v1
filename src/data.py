@@ -1,246 +1,276 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List
+from typing import Iterable, List
+import warnings
 
 import pandas as pd
-import numpy as np
+
+from data_validation import report_inception_dates, validate_price_frame
 
 
-def _download_prices(tickers: List[str], start: str, end: str) -> pd.DataFrame:
-    """Download Adjusted Close prices from yfinance for the given tickers and date range.
+def _normalize_tickers(tickers: Iterable[str]) -> List[str]:
+    normalized: List[str] = []
+    seen = set()
+    for ticker in tickers:
+        name = str(ticker).strip()
+        if not name or name in seen:
+            continue
+        normalized.append(name)
+        seen.add(name)
+    return normalized
 
-    Returns a DataFrame indexed by trading days with columns for each ticker containing
-    the Adjusted Close prices.
 
-    References SYSTEM_SPEC.md: data source must be yfinance and use Adjusted Close only.
-    This function performs a raw download and does not perform cleaning beyond basic
-    construction of the price DataFrame.
-    """
-    try:
-        import yfinance as yf
-    except Exception as e:
-        raise ImportError("yfinance is required to download price data. Install via pip.") from e
+def _as_timestamp(value: str | None) -> pd.Timestamp | None:
+    if value is None:
+        return None
+    return pd.Timestamp(value)
 
-    if not tickers:
-        return pd.DataFrame()
 
-    # yfinance can accept a list; request full OHLCV then attempt to extract 'Adj Close'
-    data = yf.download(tickers, start=start, end=end, progress=False, threads=True)
+def _format_date(value: str | pd.Timestamp | None) -> str | None:
+    if value is None:
+        return None
+    return pd.Timestamp(value).strftime("%Y-%m-%d")
 
-    if data is None or data.empty:
-        return pd.DataFrame()
+
+def _extract_adj_close(raw: pd.DataFrame, tickers: List[str]) -> pd.DataFrame:
+    if raw is None or raw.empty:
+        return pd.DataFrame(columns=tickers)
 
     adj = None
-
-    # Case 1: top-level 'Adj Close' column exists (single-level columns)
-    if isinstance(data, pd.DataFrame) and 'Adj Close' in data.columns:
-        adj = data['Adj Close']
-
-    # Case 2: MultiIndex columns where level 0 contains 'Adj Close'
-    elif isinstance(data.columns, pd.MultiIndex):
-        if 'Adj Close' in data.columns.levels[0]:
-            try:
-                adj = data.xs('Adj Close', axis=1, level=0, drop_level=True)
-            except Exception:
-                adj = None
-        elif 'Adj Close' in data.columns.levels[1]:
-            try:
-                adj = data.xs('Adj Close', axis=1, level=1, drop_level=True)
-            except Exception:
-                adj = None
-
-    # Case 3: If the DataFrame has same number of columns as tickers and numeric values,
-    # assume it's already Adjusted Close (fallback)
-    if adj is None:
-        if isinstance(data, pd.DataFrame) and data.shape[1] == len(tickers):
-            numeric = True
-            for c in data.columns:
-                if not pd.api.types.is_numeric_dtype(data[c].dtype):
-                    numeric = False
-                    break
-            if numeric:
-                adj = data.copy()
-
-    # Final fallback: try selecting columns that match tickers
-    if adj is None:
-        cols = [c for c in data.columns if str(c) in tickers or (isinstance(c, tuple) and c[-1] in tickers)]
-        if cols:
-            adj = data.loc[:, cols]
+    if isinstance(raw.columns, pd.MultiIndex):
+        if "Adj Close" in raw.columns.get_level_values(0):
+            adj = raw.xs("Adj Close", axis=1, level=0, drop_level=True)
+        elif "Adj Close" in raw.columns.get_level_values(-1):
+            adj = raw.xs("Adj Close", axis=1, level=-1, drop_level=True)
+    elif "Adj Close" in raw.columns:
+        adj = raw.loc[:, ["Adj Close"]]
 
     if adj is None:
-        return pd.DataFrame()
+        raise ValueError("yfinance response does not contain 'Adj Close'")
 
-    # Ensure DataFrame
     if isinstance(adj, pd.Series):
-        adj = adj.to_frame()
+        adj = adj.to_frame(name=tickers[0])
+    elif list(adj.columns) == ["Adj Close"] and len(tickers) == 1:
+        adj.columns = [tickers[0]]
 
-    # Normalize column names to ticker symbols where possible
-    new_cols = []
-    for c in adj.columns:
-        if isinstance(c, tuple):
-            # prefer the element that matches a ticker
+    normalized_cols: List[str] = []
+    for col in adj.columns:
+        if isinstance(col, tuple):
             matched = None
-            for part in c:
+            for part in col:
                 if str(part) in tickers:
                     matched = str(part)
                     break
-            new_cols.append(matched or str(c))
+            normalized_cols.append(matched or str(col[-1]))
         else:
-            new_cols.append(str(c))
-    adj.columns = new_cols
+            normalized_cols.append(str(col))
+    adj.columns = normalized_cols
 
-    # Keep only requested tickers (preserve order)
-    present = [t for t in tickers if t in adj.columns]
-    adj = adj.loc[:, present]
-
-    return adj
+    return adj.reindex(columns=tickers)
 
 
-def _clean_prices(df: pd.DataFrame) -> pd.DataFrame:
-    """Clean raw price DataFrame to conform with SYSTEM_SPEC.md rules.
-
-    Cleaning rules implemented:
-    - Align all tickers to a common trading-day index
-    - Forward-fill ONLY after first valid observation (ffill is per-column and will not fill
-      leading NaNs)
-    - Do NOT forward-fill leading NaN values
-    - Drop rows where all tickers are NaN
-    - Ensure dtype is float and index is timezone-naive
-    """
-    if df is None or df.empty:
+def _download_adj_close(tickers: List[str], start: str, end: str | None = None) -> pd.DataFrame:
+    """Download adjusted close data from Yahoo Finance."""
+    if not tickers:
         return pd.DataFrame()
 
-    # Make a copy and ensure datetime index
-    df = df.copy()
-    if not isinstance(df.index, pd.DatetimeIndex):
-        df.index = pd.to_datetime(df.index, errors='coerce')
-
-    # Drop rows that could not be parsed as dates
-    df = df[~df.index.isna()]
-
-    # Sort ascending
-    df = df.sort_index()
-
-    # Ensure timezone-naive index
-    if df.index.tz is not None:
-        df.index = df.index.tz_convert(None).tz_localize(None)
-
-    # Forward-fill after first valid observation per column (ffill does not fill leading NaNs)
-    df = df.ffill()
-
-    # Drop rows where all tickers are NaN
-    df = df.dropna(how='all')
-
-    # Ensure dtype float
     try:
-        df = df.astype(float)
-    except Exception:
-        # Coerce on failure
-        df = df.apply(pd.to_numeric, errors='coerce')
+        import yfinance as yf
+    except Exception as exc:
+        raise ImportError("yfinance is required to download price data") from exc
 
-    return df
+    raw = yf.download(
+        tickers=tickers,
+        start=_format_date(start),
+        end=_format_date(end),
+        progress=False,
+        auto_adjust=False,
+        actions=False,
+        threads=True,
+        group_by="column",
+    )
+    return _extract_adj_close(raw, tickers)
 
 
-def load_prices(tickers: List[str], start: str, end: str, use_cache: bool = True) -> pd.DataFrame:
-    """Load Adjusted Close price series for `tickers` between `start` and `end`.
+def _forward_fill_within_history(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=df.columns if isinstance(df, pd.DataFrame) else None)
 
-    - Returns a DataFrame of Adjusted Close prices with trading-day datetime index
-      (timezone-naive) and columns equal to the requested tickers.
-    - Caching: a `data_cache` folder is created in the repository root. Cache file name
-      format: `prices_{start}_{end}.csv`.
-    - If `use_cache` is True and the cache file exists, loads from cache. Missing tickers
-      (not present in cache) are downloaded and merged, and the cache is updated.
+    filled = df.copy()
+    for col in filled.columns:
+        series = filled[col]
+        first_valid = series.first_valid_index()
+        if first_valid is None:
+            continue
+        mask = filled.index >= first_valid
+        filled.loc[mask, col] = series.loc[mask].ffill()
+    return filled
 
-    This function strictly implements the data rules in SYSTEM_SPEC.md. It does not
-    perform any signal computation, shifting, or other strategy logic (no look-ahead).
 
-    Raises:
-        ValueError: if no data is returned for any requested ticker.
+def _clean_prices(df: pd.DataFrame, tickers: Iterable[str] | None = None) -> pd.DataFrame:
+    """Normalize price data while preserving pre-inception NaNs."""
+    if df is None or df.empty:
+        columns = _normalize_tickers(tickers or [])
+        return pd.DataFrame(columns=columns, dtype=float)
+
+    cleaned = df.copy()
+    if not isinstance(cleaned.index, pd.DatetimeIndex):
+        cleaned.index = pd.to_datetime(cleaned.index, errors="coerce")
+    cleaned = cleaned.loc[~cleaned.index.isna()]
+    if cleaned.index.tz is not None:
+        cleaned.index = cleaned.index.tz_convert(None).tz_localize(None)
+
+    cleaned = cleaned.sort_index()
+    cleaned = cleaned.loc[~cleaned.index.duplicated(keep="last")]
+    cleaned = cleaned.loc[:, ~cleaned.columns.duplicated(keep="last")]
+    cleaned = cleaned.apply(pd.to_numeric, errors="coerce").astype(float)
+    cleaned = _forward_fill_within_history(cleaned)
+    cleaned = cleaned.dropna(how="all")
+
+    columns = _normalize_tickers(tickers or cleaned.columns.tolist())
+    if columns:
+        cleaned = cleaned.reindex(columns=columns)
+    return cleaned
+
+
+def _load_cached_prices(cache_path: str) -> pd.DataFrame:
+    path = Path(cache_path)
+    if not path.exists():
+        return pd.DataFrame()
+    cached = pd.read_parquet(path)
+    return _clean_prices(cached)
+
+
+def _save_cached_prices(prices: pd.DataFrame, cache_path: str) -> None:
+    path = Path(cache_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    prices.to_parquet(path)
+
+
+def _slice_date_range(prices: pd.DataFrame, start: str, end: str | None) -> pd.DataFrame:
+    start_ts = pd.Timestamp(start)
+    end_ts = _as_timestamp(end)
+    sliced = prices.loc[prices.index >= start_ts]
+    if end_ts is not None:
+        sliced = sliced.loc[sliced.index <= end_ts]
+    return sliced
+
+
+def _warn_for_short_history(prices: pd.DataFrame) -> None:
+    for col in prices.columns:
+        history = int(prices[col].notna().sum())
+        if 0 < history < 252:
+            warnings.warn(
+                f"{col} has only {history} non-null observations (<252 trading days)",
+                stacklevel=2,
+            )
+
+
+def _apply_strict_inception(prices: pd.DataFrame, strict_inception: bool) -> pd.DataFrame:
+    if not strict_inception or prices.empty:
+        return prices
+
+    inceptions = report_inception_dates(prices)
+    valid = inceptions.dropna()
+    if valid.empty:
+        return prices
+    return prices.loc[prices.index >= valid.max()]
+
+
+def get_prices(
+    tickers: list[str],
+    start: str,
+    end: str | None = None,
+    cache_path: str = "data/prices.parquet",
+    refresh: bool = False,
+    incremental: bool = True,
+    strict_inception: bool = True,
+) -> pd.DataFrame:
+    """Return cleaned adjusted-close prices with deterministic parquet caching.
+
+    When `strict_inception` is True, the returned frame is trimmed so the first date
+    is the latest inception date across the requested tickers. This avoids starting a
+    backtest before all assets are live. The cache still retains the full downloaded
+    history. When False, missing pre-inception values are preserved and downstream
+    fallback logic can handle them.
     """
-    # Validate inputs
-    tickers = [t for t in tickers]  # ensure list-like of strings
-    if not tickers:
-        raise ValueError("`tickers` must be a non-empty list of ticker symbols.")
+    requested = _normalize_tickers(tickers)
+    if not requested:
+        raise ValueError("tickers must be a non-empty list")
 
+    cache = pd.DataFrame()
+    if not refresh:
+        cache = _load_cached_prices(cache_path)
+
+    combined = cache.copy()
+    if refresh or cache.empty:
+        fetched = _clean_prices(_download_adj_close(requested, start, end), requested)
+        combined = fetched
+    else:
+        missing_tickers = [ticker for ticker in requested if ticker not in combined.columns]
+        if missing_tickers:
+            missing_history = _clean_prices(_download_adj_close(missing_tickers, start, end), missing_tickers)
+            combined = missing_history.combine_first(combined)
+
+        if incremental and not combined.empty:
+            last_cached = combined.index.max()
+            fetch_end = _as_timestamp(end)
+            needs_update = fetch_end is None or last_cached < fetch_end
+            if needs_update:
+                fetch_start = (last_cached + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+                updated = _clean_prices(_download_adj_close(requested, fetch_start, end), requested)
+                if not updated.empty:
+                    combined = updated.combine_first(combined)
+
+        combined = _clean_prices(combined, combined.columns.tolist())
+
+    if combined.empty:
+        raise ValueError("No price data available for the requested range")
+
+    validate_price_frame(combined)
+    _save_cached_prices(combined, cache_path)
+
+    result = combined.reindex(columns=requested)
+    result = _slice_date_range(result, start, end)
+    result = _clean_prices(result, requested)
+    result = _apply_strict_inception(result, strict_inception)
+
+    if result.empty or result.notna().sum().sum() == 0:
+        raise ValueError("No price data returned for the requested tickers")
+
+    validate_price_frame(result)
+    _warn_for_short_history(result)
+    return result
+
+
+def load_prices(
+    tickers: List[str],
+    start: str,
+    end: str,
+    use_cache: bool = True,
+    strict_inception: bool = True,
+) -> pd.DataFrame:
+    """Compatibility wrapper around `get_prices` with a per-range cache file."""
     project_root = Path(__file__).resolve().parents[1]
     cache_dir = project_root / "data_cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    cache_file = cache_dir / f"prices_{start}_{end}.csv"
+    parquet_cache = cache_dir / f"prices_{start}_{end}.parquet"
+    legacy_csv_cache = cache_dir / f"prices_{start}_{end}.csv"
 
-    df_cache = pd.DataFrame()
-    if use_cache and cache_file.exists():
-        try:
-            df_cache = pd.read_csv(cache_file, index_col=0, parse_dates=True)
-        except Exception:
-            df_cache = pd.DataFrame()
+    if use_cache and not parquet_cache.exists() and legacy_csv_cache.exists():
+        legacy = pd.read_csv(legacy_csv_cache, index_col=0, parse_dates=True)
+        legacy = _clean_prices(legacy)
+        validate_price_frame(legacy)
+        _save_cached_prices(legacy, str(parquet_cache))
 
-    # Determine which tickers are missing from cache
-    needed = [t for t in tickers if t not in df_cache.columns]
-
-    downloaded = pd.DataFrame()
-    if needed:
-        downloaded = _download_prices(needed, start, end)
-
-    # Merge cache and newly downloaded. Avoid duplicate columns after concat.
-    if not df_cache.empty and not downloaded.empty:
-        df = pd.concat([df_cache, downloaded], axis=1, join='outer')
-        # Drop duplicate columns (keep first occurrence)
-        df = df.loc[:, ~df.columns.duplicated()]
-    elif not df_cache.empty:
-        df = df_cache
-    else:
-        df = downloaded
-
-    # If cache existed but did not include desired tickers and we didn't download any data
-    # (e.g., network issue), ensure df still contains something
-    if df is None or df.empty:
-        raise ValueError("No price data available for the requested date range.")
-
-    # Clean
-    df = _clean_prices(df)
-
-    # If some tickers originally requested are missing entirely from df, warn.
-    # Use robust checks that handle duplicate column names or unexpected structures.
-    def _col_all_na(frame: pd.DataFrame, col) -> bool:
-        series_or_df = frame[col]
-        if isinstance(series_or_df, pd.DataFrame):
-            return bool(series_or_df.isna().all().all())
-        return bool(series_or_df.isna().all())
-
-    missing_all = [t for t in tickers if (t not in df.columns) or _col_all_na(df, t)]
-    for t in missing_all:
-        print(f"Warning: ticker '{t}' has no data in the requested range ({start} to {end}).")
-
-    # Ensure at least one ticker has data
-    cols_with_data = [c for c in df.columns if not _col_all_na(df, c)]
-    if not cols_with_data:
-        raise ValueError("No price data returned for any requested ticker.")
-
-    # Subset to requested tickers preserving column order
-    available = [t for t in tickers if t in df.columns]
-    result = df.reindex(columns=available)
-
-    # Update cache: save the full merged DataFrame (not just subset) so future calls
-    # can reuse existing data. Do not overwrite cache if it did not previously exist and
-    # there was a download failure (df may be empty handled above).
-    try:
-        # When writing, ensure index has no timezone and is sorted
-        to_save = df.sort_index()
-        if to_save.index.tz is not None:
-            to_save.index = to_save.index.tz_convert(None).tz_localize(None)
-        to_save.to_csv(cache_file)
-    except Exception:
-        # Cache write failure should not prevent return of results
-        pass
-
-    return result
-
-
-if __name__ == "__main__":
-    # Smoke test per requirement
-    test_tickers = ["SPY", "TLT", "GLD"]
-    df = load_prices(test_tickers, "2015-01-01", "2024-01-01")
-    print(df.head())
-    print(df.tail())
+    return get_prices(
+        tickers=tickers,
+        start=start,
+        end=end,
+        cache_path=str(parquet_cache),
+        refresh=not use_cache,
+        incremental=False,
+        strict_inception=strict_inception,
+    )

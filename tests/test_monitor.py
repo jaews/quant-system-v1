@@ -189,21 +189,32 @@ def test_vol_scale_alert_when_below_one():
     assert 'vol_scale_below_1' in state['alerts']
 
 
-def test_next_rebalance_date_uses_inclusive_last_trading_friday():
+def test_next_rebalance_date_returns_month_last_trading_friday_for_mid_month_asof():
     idx = pd.bdate_range('2020-05-01', '2020-06-30')
     assert next_rebalance_date(idx, pd.Timestamp('2020-05-20')) == pd.Timestamp('2020-05-29')
-    assert next_rebalance_date(idx, pd.Timestamp('2020-05-29')) == pd.Timestamp('2020-05-29')
-    assert next_rebalance_date(idx, pd.Timestamp('2020-06-30')) is None
 
 
-def test_compute_current_state_sets_next_rebalance_for_terminal_month():
-    idx = pd.bdate_range('2020-05-01', '2020-05-29')
+def test_next_rebalance_date_is_strictly_after_asof_and_never_returns_monday():
+    idx = pd.bdate_range('2026-03-02', '2026-04-30')
+    asof = pd.Timestamp('2026-03-02')
+
+    next_reb = next_rebalance_date(idx, asof)
+
+    assert next_reb == pd.Timestamp('2026-03-27')
+    assert next_reb > asof
+    assert next_reb != asof
+    assert next_reb.weekday() == 4
+
+
+def test_compute_current_state_sets_next_rebalance_unavailable_when_dataset_ends_early():
+    idx = pd.bdate_range('2020-04-01', '2020-05-01')
     prices = make_prices(idx, ['SPY', 'TLT', 'BIL'], {'SPY': 0.0, 'TLT': 0.0, 'BIL': 0.0})
     eq = pd.Series(np.linspace(1.0, 1.1, len(idx)), index=idx)
 
     state = compute_current_state(prices, eq)
-    assert state['asof'] == pd.Timestamp('2020-05-29')
-    assert state['next_rebalance'] == pd.Timestamp('2020-05-29')
+    assert state['asof'] == pd.Timestamp('2020-05-01')
+    assert state['next_rebalance'] is None
+    assert 'next_rebalance_unavailable' in state['alerts']
 
 
 def test_compute_current_state_ignores_future_equity_after_asof():

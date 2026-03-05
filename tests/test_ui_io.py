@@ -1,5 +1,6 @@
 import io
 import hashlib
+import json
 
 import pytest
 import pandas as pd
@@ -60,3 +61,20 @@ def test_load_prices_parquet_if_supported():
     out = ui_io.load_prices_bytes(data, 'file.parquet')
     assert list(out.columns) == ['X']
     assert len(out) == 2
+
+
+def test_slice_prices_strict_inception():
+    idx = pd.date_range('2020-01-01', periods=4, freq='D')
+    df = pd.DataFrame({
+        'SPY': [1.0, 2.0, 3.0, 4.0],
+        'TLT': [float('nan'), 5.0, 6.0, 7.0],
+    }, index=idx)
+
+    out = ui_io.slice_prices(df, tickers=('SPY', 'TLT'), start='2020-01-01', end=None, strict_inception=True)
+    assert out.index.min() == pd.Timestamp('2020-01-02')
+
+
+def test_parse_json_config_from_string():
+    cfg = {'target_vol': 0.1, 'band': 0.05}
+    out = ui_io.parse_json_config(json.dumps(cfg))
+    assert out == cfg
